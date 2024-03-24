@@ -1,0 +1,142 @@
+From 93ff684f20456506ddbe190e572a0e1da6b275ae Mon Sep 17 00:00:00 2001
+From: Kajetan Puchalski <kajetan.puchalski@tuta.io>
+Date: Sun, 24 Mar 2024 18:51:41 +0000
+Subject: [PATCH 1/2] cpuidle: teo: Trace TEO & sched internals
+
+Trace TEO and scheduler rq internals at every idle sleep selection.
+Data collection for training ml-idle models.
+---
+ drivers/cpuidle/governors/teo.c | 53 ++++++++++++++++++++++++++++++++-
+ 1 file changed, 52 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/cpuidle/governors/teo.c b/drivers/cpuidle/governors/teo.c
+index 987fc5f3997d..539bc1d51243 100644
+--- a/drivers/cpuidle/governors/teo.c
++++ b/drivers/cpuidle/governors/teo.c
+@@ -136,6 +136,8 @@
+ #include <linux/jiffies.h>
+ #include <linux/kernel.h>
+ #include <linux/sched.h>
++#include <linux/sched/cputime.h>
++#include "../../kernel/sched/sched.h"
+ #include <linux/sched/clock.h>
+ #include <linux/sched/topology.h>
+ #include <linux/tick.h>
+@@ -197,7 +199,13 @@ struct teo_cpu {
+ 	int next_recent_idx;
+ 	int recent_idx[NR_RECENT];
+ 	unsigned long util_threshold;
++	unsigned long max_cap;
+ 	bool utilized;
++  u32 rq_cpu_time;
++  u32 ttwu_count;
++  u32 yld_count;
++  u32 sched_count;
++  u64 sleep_id;
+ };
+ 
+ static DEFINE_PER_CPU(struct teo_cpu, teo_cpus);
+@@ -227,7 +235,7 @@ static bool teo_cpu_is_utilized(int cpu, struct teo_cpu *cpu_data)
+ static void teo_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+ {
+ 	struct teo_cpu *cpu_data = per_cpu_ptr(&teo_cpus, dev->cpu);
+-	int i, idx_timer = 0, idx_duration = 0;
++	int i, idx_timer = 0, idx_duration = 0, hit = -1;
+ 	u64 measured_ns;
+ 
+ 	if (cpu_data->time_span_ns >= cpu_data->sleep_length_ns) {
+@@ -299,12 +307,19 @@ static void teo_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
+ 	if (idx_timer == idx_duration) {
+ 		cpu_data->state_bins[idx_timer].hits += PULSE;
+ 		cpu_data->recent_idx[i] = -1;
++    hit = 1;
+ 	} else {
+ 		cpu_data->state_bins[idx_duration].intercepts += PULSE;
+ 		cpu_data->state_bins[idx_duration].recent++;
+ 		cpu_data->recent_idx[i] = idx_duration;
++    hit = 0;
+ 	}
+ 
++  trace_printk(
++      "cpu=%d sleep_id=%llu hit=%d timer_state=%d duration_state=%d sleep_length=%lld time_span=%lld measured=%lld\n",
++      dev->cpu, cpu_data->sleep_id, hit, idx_timer, idx_duration, cpu_data->sleep_length_ns, cpu_data->time_span_ns, measured_ns
++  );
++
+ 	cpu_data->total += PULSE;
+ }
+ 
+@@ -368,17 +383,41 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+ 	ktime_t delta_tick;
+ 	s64 duration_ns;
+ 	int i;
++  struct rq *rq = cpu_rq(dev->cpu);
++  u32 rq_cpu_time_delta, ttwu_count_delta, yld_count_delta, sched_count_delta;
+ 
+ 	if (dev->last_state_idx >= 0) {
+ 		teo_update(drv, dev);
+ 		dev->last_state_idx = -1;
+ 	}
+ 
++  cpu_data->sleep_id++;
++  if (cpu_data->sleep_id == U64_MAX)
++    cpu_data->sleep_id = 0;
++
+ 	cpu_data->time_span_ns = local_clock();
+ 
+ 	duration_ns = tick_nohz_get_sleep_length(&delta_tick);
+ 	cpu_data->sleep_length_ns = duration_ns;
+ 
++  rq_cpu_time_delta = rq->rq_cpu_time - cpu_data->rq_cpu_time;
++  ttwu_count_delta = rq->ttwu_count - cpu_data->ttwu_count;
++  sched_count_delta = rq->sched_count - cpu_data->sched_count;
++  yld_count_delta = rq->yld_count - cpu_data->yld_count;
++
++  cpu_data->rq_cpu_time = rq->rq_cpu_time;
++  cpu_data->ttwu_count = rq->ttwu_count;
++  cpu_data->sched_count = rq->sched_count;
++  cpu_data->yld_count = rq->yld_count;
++
++  trace_printk(
++      "cpu=%d sleep_id=%llu sleep_length_ns=%lld max_cap=%lu util=%lu s0hit=%u s0int=%u s0rec=%u s1hit=%u rq_cpu_time=%u ttwu_count=%u sched_count=%u yld_count=%u\n",
++      dev->cpu, cpu_data->sleep_id, duration_ns, cpu_data->max_cap, sched_cpu_util(dev->cpu),
++      cpu_data->state_bins[0].hits, cpu_data->state_bins[0].intercepts, cpu_data->state_bins[0].recent,
++      cpu_data->state_bins[1].hits, rq_cpu_time_delta, ttwu_count_delta, sched_count_delta, yld_count_delta
++  );
++
++
+ 	/* Check if there is any choice in the first place. */
+ 	if (drv->state_count < 2) {
+ 		idx = 0;
+@@ -589,6 +628,11 @@ static void teo_reflect(struct cpuidle_device *dev, int state)
+ 	} else {
+ 		cpu_data->time_span_ns = local_clock() - cpu_data->time_span_ns;
+ 	}
++
++  trace_printk(
++      "cpu=%d sleep_id=%llu sleep_length_ns=%lld time_span_ns=%lld state=%d\n",
++      dev->cpu, cpu_data->sleep_id, cpu_data->sleep_length_ns, cpu_data->time_span_ns, state
++  );
+ }
+ 
+ /**
+@@ -601,10 +645,17 @@ static int teo_enable_device(struct cpuidle_driver *drv,
+ {
+ 	struct teo_cpu *cpu_data = per_cpu_ptr(&teo_cpus, dev->cpu);
+ 	unsigned long max_capacity = arch_scale_cpu_capacity(dev->cpu);
++  struct rq *rq = cpu_rq(dev->cpu);
+ 	int i;
+ 
+ 	memset(cpu_data, 0, sizeof(*cpu_data));
+ 	cpu_data->util_threshold = max_capacity >> UTIL_THRESHOLD_SHIFT;
++  cpu_data->max_cap = max_capacity;
++  cpu_data->sleep_id = 0;
++  cpu_data->rq_cpu_time = rq->rq_cpu_time;
++  cpu_data->ttwu_count = rq->ttwu_count;
++  cpu_data->yld_count = rq->yld_count;
++  cpu_data->sched_count = rq->sched_count;
+ 
+ 	for (i = 0; i < NR_RECENT; i++)
+ 		cpu_data->recent_idx[i] = -1;
+-- 
+2.34.1
+
